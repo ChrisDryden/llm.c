@@ -25,6 +25,9 @@ thread coarsening/ILP
 #include <cuda_runtime.h>
 #include "common.h"
 
+__device__ float& vec_at(float4& vec, int index) {
+    return reinterpret_cast<float*>(&vec)[index];
+}
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -97,6 +100,30 @@ __global__ void adamw_kernel2(float* params_memory, const float* grads_memory, f
    params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
 }
 
+// Slightly more optimized AdamW kernel by refactoring the constants and using float4
+__global__ void adamw_kernel3(float4* params_memory, const float4* grads_memory, float4* m_memory, float4* v_memory, long num_parameters,
+                              const float learning_rate_corrected, const float beta1, const float beta2, 
+                              const float beta2_correction, const float eps, const float weight_decay_corrected) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_parameters) return;  // guard
+    float4 mem = __ldg(&params_memory[i]);
+    float4 grad = __ldg(&grads_memory[i]);
+    float4 m = m_memory[i];
+    float4 v = v_memory[i];
+
+    #pragma unroll 4
+    for(int i = 0; i < 4; i++ ){
+        vec_at(v,i) = lerp(vec_at(grad,i) * vec_at(grad,i), vec_at(v,i), beta2);
+        vec_at(m,i) = lerp(vec_at(grad,i), vec_at(m,i), beta1);
+        vec_at(mem,i) -= learning_rate_corrected * ((vec_at(m,i)/(sqrtf(vec_at(v,i) / beta2_correction) + eps))  + weight_decay_corrected * vec_at(mem,i));
+    }
+
+    m_memory[i] = m;
+    v_memory[i] = v;
+    params_memory[i] = mem;
+}
+
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -121,6 +148,18 @@ void adamw_dispatch2(float* params_memory, const float* grads_memory, float* m_m
     cudaCheck(cudaGetLastError());
 }
 
+// version 3: optimized by using float4
+void adamw_dispatch3(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                     float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    unsigned int block_size = 512;
+    float learning_rate_corrected = (learning_rate / beta1_correction);
+    float weight_decay_corrected = (weight_decay / beta1_correction);
+    unsigned int num_blocks = ceil_div((long) num_parameters/4, (long) block_size);
+    adamw_kernel3<<<num_blocks, block_size>>>((float4 *)params_memory, (float4 *)grads_memory, (float4 *)m_memory,(float4 *) v_memory, num_parameters,
+                                              learning_rate_corrected, beta1, beta2, beta2_correction, eps, weight_decay_corrected);
+    cudaCheck(cudaGetLastError());
+}
+
 void adamw(int kernel_num,
            float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters,
            float learning_rate=1e-3, float beta1=0.9, float beta2=0.999, float eps=1e-8, float weight_decay=0.0) {
@@ -136,6 +175,10 @@ void adamw(int kernel_num,
             adamw_dispatch2(params_memory, grads_memory, m_memory, v_memory, num_parameters,
                             learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
+        case 3:
+            adamw_dispatch3(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+            break;
         default:
             printf("Invalid kernel number\n");
             exit(1);
@@ -147,7 +190,7 @@ void adamw(int kernel_num,
 int main(int argc, char **argv) {
     srand(0);
 
-    const long num_parameters = 1048576;
+    const long num_parameters = 1048576*128; //updated to have time closer to training script
     const int t = 10;
 
     const float learning_rate = 1e-3f;
