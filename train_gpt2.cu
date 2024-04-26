@@ -47,7 +47,9 @@ and fp8 (coming soon^TM).
 // use bf16 (bfloat 16)
 #if defined(ENABLE_BF16)
 typedef __nv_bfloat16 floatX;
+typedef int4 floatF;
 typedef float floatN;
+#define ROLLUP_FACTOR 8
 #define CUBLAS_LOWP CUDA_R_16BF
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 
@@ -59,7 +61,9 @@ const ncclDataType_t ncclFloatN = ncclFloat;
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
 typedef half floatX;
+typedef int4 floatF;
 typedef float floatN;
+#define ROLLUP_FACTOR 8
 #define CUBLAS_LOWP CUDA_R_16F
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 
@@ -71,7 +75,9 @@ const ncclDataType_t ncclFloatN = ncclFloat;
 // fallback for fp32
 #else
 typedef float floatX;
+typedef int4 floatF;
 typedef float floatN;
+#define ROLLUP_FACTOR 4
 #define CUBLAS_LOWP CUDA_R_32F
 #define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
 
@@ -685,28 +691,44 @@ __global__ void residual_forward_kernel(TOut* out, T1* inp1, T2* inp2, int N) {
 }
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel(floatX* out, const floatX* inp, int N) {
+__global__ void gelu_forward_kernel(floatF* out, const floatF* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
-        float xi = (float)inp[i];
+    if(i < N){ 
+    int4 data = inp[i];
+    floatX* bfloat16_ptr = (floatX*)&data;
+    floatX local_out[ROLLUP_FACTOR];
+    #pragma unroll
+    for(int j = 0; j < ROLLUP_FACTOR; j++){
+        float xi = (float)bfloat16_ptr[j];
         float cube = 0.044715f * xi * xi * xi;
-        out[i] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
+        local_out[j] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
+    }
+    floatF* store_data = reinterpret_cast<floatF*>(local_out);
+    out[i] = *store_data;
     }
 }
 
-__global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
+__global__ void gelu_backward_kernel(int4* dinp, const int4* inp, const int4* dout, const int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
-        float x = (float)inp[i];
+    if (!(i < N)) return;
+    floatX* x_ptr = (floatX*)&inp[i];
+    floatX* dout_ptr = (floatX*)&dout[i];
+    floatX local_out[ROLLUP_FACTOR];
+    #pragma unroll
+    for(int j = 0; j < ROLLUP_FACTOR; j++){
+        float x = (float)x_ptr[j];
         float cube = 0.044715f * x * x * x;
         float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
         float tanh_out = tanhf(tanh_arg);
         float coshf_out = coshf(tanh_arg);
         float sech_out = 1.0f / (coshf_out * coshf_out);
         float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-        dinp[i] = (floatX)(local_grad * (float)dout[i]);
+        local_out[j] = (floatX)(local_grad * (float)dout_ptr[j]);
     }
+    floatF* store_data = reinterpret_cast<floatF*>(local_out);
+    dinp[i] = *store_data;
 }
+
 
 __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int C) {
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
@@ -1329,15 +1351,15 @@ void residual_forward(TOut* out, T1* inp1, T2* inp2, int N) {
 
 void gelu_forward(floatX* out, const floatX* inp, int N) {
     const int block_size = 128;
-    const int grid_size = CEIL_DIV(N, block_size);
-    gelu_forward_kernel<<<grid_size, block_size>>>(out, inp, N);
+    const int grid_size = CEIL_DIV(N/ROLLUP_FACTOR, block_size);
+    gelu_forward_kernel<<<grid_size, block_size>>>((int4*)out,(int4*)inp, N);
     cudaCheck(cudaGetLastError());
 }
 
 void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
     const int block_size = 128;
-    const int grid_size = CEIL_DIV(N, block_size);
-    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
+    const int grid_size = CEIL_DIV(N/ROLLUP_FACTOR, block_size);
+    gelu_backward_kernel<<<grid_size, block_size>>>((int4*)dinp, (int4*)inp, (int4*)dout, N);
     cudaCheck(cudaGetLastError());
 }
 
