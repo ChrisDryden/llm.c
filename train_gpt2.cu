@@ -578,24 +578,31 @@ __global__ void permute_kernel_backward(floatX* dinp,
     }
 }
 
-__global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel(floatF* inp, floatX *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx_c = idx * 8;
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
-    if (idx < B * NH * N * d) {
-        int b = idx / (NH * N * d);
-        int rest = idx % (NH * N * d);
-        int nh_ = rest / (N * d);
-        rest = rest % (N * d);
-        int n = rest / d;
-        int d_ = rest % d;
-        int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        out[other_idx] = __ldcs(&inp[idx]);
-    }
+    floatF inp1 = inp[idx];
+    floatX* inp_ptr = (floatX*)&inp1;
+
+    for(int j = 0; j < ROLLUP_FACTOR; j++){
+        if ((idx_c)+j < B * NH * N * d) {
+            int b = (idx_c)+j / (NH * N * d);
+            int rest = (idx_c)+j % (NH * N * d);
+            int nh_ = rest / (N * d);
+            rest = rest % (N * d);
+            int n = rest / d;
+            int d_ = rest % d;
+            int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
+                out[other_idx] = inp_ptr[j];
+            }
+        }
 }
 
 __global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int B, int N, int NH, int d) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
     if (idx < B * NH * N * d) {
         int b = idx / (NH * N * d);
         int rest = idx % (NH * N * d);
@@ -606,14 +613,6 @@ __global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int 
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
         dinp[idx] = (floatX)dout[other_idx];
     }
-}
-
-__device__ float& vec_at(float4& vec, int index) {
-    return reinterpret_cast<float*>(&vec)[index];
-}
-
-__device__ float vec_at(const float4& vec, int index) {
-    return reinterpret_cast<const float*>(&vec)[index];
 }
 
 template <typename Type>
@@ -682,18 +681,26 @@ __global__ void softmax_forward_kernel5(Type* out, float inv_temperature, const 
     }
 }
 
-template <typename TOut, typename T1, typename T2>
-__global__ void residual_forward_kernel(TOut* out, T1* inp1, T2* inp2, int N) {
+__global__ void residual_forward_kernel(floatF* out, floatF* inp1, floatF* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        out[idx] = (TOut)((float)__ldcs(&inp1[idx]) + (float)__ldcs(&inp2[idx]));
+    int4 data1 = inp1[idx];
+    int4 data2 = inp2[idx];
+    floatX* data1_ptr = (floatX*)&data1;
+    floatX* data2_ptr = (floatX*)&data2;
+    floatX local_out[ROLLUP_FACTOR];
+    #pragma unroll
+    for(int j = 0; j < ROLLUP_FACTOR; j++){
+        float x1 = (float)data1_ptr[j];
+        float x2 = (float)data2_ptr[j];
+        local_out[j] = (floatX)(x1 + x2);
+    floatF* store_data = reinterpret_cast<floatF*>(local_out);
+    out[idx] = *store_data;
     }
 }
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 __global__ void gelu_forward_kernel(floatF* out, const floatF* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if(i < N){ 
     int4 data = inp[i];
     floatX* bfloat16_ptr = (floatX*)&data;
     floatX local_out[ROLLUP_FACTOR];
@@ -705,12 +712,10 @@ __global__ void gelu_forward_kernel(floatF* out, const floatF* inp, int N) {
     }
     floatF* store_data = reinterpret_cast<floatF*>(local_out);
     out[i] = *store_data;
-    }
 }
 
 __global__ void gelu_backward_kernel(int4* dinp, const int4* inp, const int4* dout, const int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (!(i < N)) return;
     floatX* x_ptr = (floatX*)&inp[i];
     floatX* dout_ptr = (floatX*)&dout[i];
     floatX local_out[ROLLUP_FACTOR];
@@ -1336,30 +1341,30 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    num_blocks = CEIL_DIV((B * T * C)/4, block_size);
+    unpermute_kernel<<<num_blocks, block_size>>>((floatF *)vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
 template <typename TOut, typename T1, typename T2>
 void residual_forward(TOut* out, T1* inp1, T2* inp2, int N) {
     const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    const int grid_size = CEIL_DIV(N/ROLLUP_FACTOR, block_size);
+    residual_forward_kernel<<<grid_size, block_size>>>((floatF*)out, (floatF*)inp1, (floatF*)inp2, N);
     cudaCheck(cudaGetLastError());
 }
 
 void gelu_forward(floatX* out, const floatX* inp, int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N/ROLLUP_FACTOR, block_size);
-    gelu_forward_kernel<<<grid_size, block_size>>>((int4*)out,(int4*)inp, N);
+    gelu_forward_kernel<<<grid_size, block_size>>>((floatF*)out,(floatF*)inp, N);
     cudaCheck(cudaGetLastError());
 }
 
 void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N/ROLLUP_FACTOR, block_size);
-    gelu_backward_kernel<<<grid_size, block_size>>>((int4*)dinp, (int4*)inp, (int4*)dout, N);
+    gelu_backward_kernel<<<grid_size, block_size>>>((floatF*)dinp, (floatF*)inp, (floatF*)dout, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2477,7 +2482,7 @@ int main(int argc, char *argv[]) {
     dataloader_init(&train_loader, &multi_gpu_config, train_tokens_filename, B, T);
     DataLoader val_loader;
     dataloader_init(&val_loader, &multi_gpu_config, val_tokens_filename, B, T);
-    int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
+    int train_num_batches = 20;//train_loader.num_batches; // let's do 1 epoch by default for now
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
