@@ -227,6 +227,7 @@ struct alignas(16) Packed128 {
 
 // short-form typedef
 typedef Packed128<float> f128;
+typedef Packed128<floatX> x128;
 
 // load a Packed128 from an aligned memory address
 template<class ElementType>
@@ -566,17 +567,24 @@ __global__ void permute_kernel_backward(floatX* dinp,
 
 __global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
-    if (idx < B * NH * N * d) {
-        int b = idx / (NH * N * d);
-        int rest = idx % (NH * N * d);
-        int nh_ = rest / (N * d);
-        rest = rest % (N * d);
-        int n = rest / d;
-        int d_ = rest % d;
-        int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        out[other_idx] = __ldcs(&inp[idx]);
+    x128 inp_packed = load128cs(inp+idx);
+    int Nd = N * d;
+    int validation_check = B * NH * Nd;
+    int size = (NH * Nd);
+    #pragma unroll inp_packed.size
+    for(int k = 0; k < inp_packed.size; ++k){
+        if ((idx+k) < validation_check) {
+            int b = (idx+k) / size;
+            int rest = (idx+k) % size;
+            int nh_ = rest / Nd;
+            rest = rest % Nd;
+            int n = rest / d;
+            int d_ = rest % d;
+            int other_idx = (b * NH * Nd) + (n * NH * d) + (nh_ * d) + d_;
+            out[other_idx] = inp_packed[k];
+        }
     }
 }
 
@@ -1178,7 +1186,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = CEIL_DIV(B * T * C, block_size);
+    num_blocks = CEIL_DIV(B * T * C, block_size)/x128::size;
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
