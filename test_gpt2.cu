@@ -101,6 +101,8 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+    model.recompute = 2;
+
 
     gpt2_build_from_checkpoint(&model, load_filename);
     size_t V = model.config.vocab_size;

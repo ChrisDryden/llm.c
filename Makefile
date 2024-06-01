@@ -20,7 +20,7 @@ NVCC_LDLIBS =
 NCLL_INCUDES =
 NVCC_CUDNN =
 # By default we don't build with cudnn because it blows up compile time from a few seconds to ~minute
-USE_CUDNN ?= 0
+USE_CUDNN ?= 1
 
 # Function to check if a file exists in the PATH
 ifneq ($(OS), Windows_NT)
