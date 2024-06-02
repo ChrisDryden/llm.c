@@ -655,19 +655,49 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __re
     int warp_id = threadIdx.x / WARP_SIZE;
     int num_warps = blockDim.x / WARP_SIZE;
 
-    int idx = blockIdx.x * num_warps + warp_id;
+    int idx = (blockIdx.x * num_warps + warp_id); // * x128::size;
     if(idx >= N) { return; } // guard
 
     // the row of input that this group of threads is responsible for
     const floatX* x = inp + idx * C;
 
-    float m = (float) mean[idx];
-    float s = (float) rstd[idx];
+    // mean
+    float sum = 0.0f;
+    for (int i = lane_id * x128::size; i < C; i += WARP_SIZE * x128::size ) {
+        x128 inp_packed = load128(x + i);
+        for (int k = 0; k < x128::size; ++k) {
+            sum += (float)inp_packed[k];
+        }
+    }
+
+    sum = warpReduceSum(sum);
+    float m = sum / C;
+    if(lane_id == 0 && mean != nullptr) {
+        __stcs(mean + idx, (floatX)m);
+    }
+
+    // rstd
+    sum = 0.0f;
+    for (int i = lane_id * x128::size; i < C; i += WARP_SIZE * x128::size) {
+        x128 inp_packed = load128(x + i);
+        for (int k = 0; k < x128::size; ++k) {
+            float diff = (float)inp_packed[k] - m;
+            sum += diff * diff;
+        }
+    }
+
+    sum = warpReduceSum(sum);
+    float s = rsqrtf(sum / C + 1e-5f);
+    if(lane_id == 0 && rstd != nullptr) {
+        __stcs(rstd + idx, (floatX)s);
+    }
+
 
     floatX* o = out + idx * C;
-    for (int c = lane_id * x128::size; c < C; c += WARP_SIZE * x128::size) {
+    int c = lane_id * x128::size;
+    for (; c < C; c += WARP_SIZE * x128::size) {
         // Load data into packed format
-        x128 inp_packed = load128(x + c);
+        x128 inp_packed = load128cs(x + c);
         x128 weight_packed = load128(weight + c);
         x128 bias_packed = load128(bias + c);
 
@@ -683,67 +713,6 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __re
     }
 }
 
-__global__ void mean_rstd(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
-                                    const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
-                                    const floatX* __restrict__ bias, int N, int C) {
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int num_warps = blockDim.x / WARP_SIZE;
-
-    int idx = blockIdx.x * num_warps + warp_id;
-    if(idx >= N) { return; } // guard
-
-    // the row of input that this group of threads is responsible for
-    const floatX* x = inp + idx * C;
-
-    // mean
-    float sum = 0.0f;
-    for (int i = lane_id; i < C; i += WARP_SIZE) {
-        sum += (float)x[i];
-    }
-    sum = warpReduceSum(sum);
-    float m = sum / C;
-    if(lane_id == 0 && mean != nullptr) {
-        __stcs(mean + idx, (floatX)m);
-    }
-
-    // rstd
-    sum = 0.0f;
-    for (int i = lane_id; i < C; i += WARP_SIZE) {
-        float diff = (float)x[i] - m;
-        sum += diff * diff;
-    }
-    sum = warpReduceSum(sum);
-    if(lane_id == 0 && rstd != nullptr) {
-        float s = rsqrtf(sum / C + 1e-5f);
-        __stcs(rstd + idx, (floatX)s);
-    }
-}
-
-
-// __global__ void layernorm_forward_kernel_optimized(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
-//                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
-//                                     const floatX* __restrict__ bias, int N, int C) {
-//     int lane_id = threadIdx.x % WARP_SIZE;
-//     int warp_id = threadIdx.x / WARP_SIZE;
-//     int num_warps = blockDim.x / WARP_SIZE;
-
-//     int idx = blockIdx.x * num_warps + warp_id;
-//     if(idx >= N) { return; } // guard
-
-//     float m = mean[idx];
-//     float s = rstd[idx];
-//     const floatX* x = inp + idx * C;
-//     floatX* o = out + idx * C;
-    
-//     for (int c = lane_id; c < C; c += WARP_SIZE) {
-//         // load and store using the .cs "streaming" hint to the compiler,
-//         // indicating that this data will not be reused soon, and can be streamed through the caches
-//         // this allows the threads to get more cache-hits for the (shared) weight and bias parameters        
-//         float n = s * ((float)__ldcs(x+c) - m);
-//         __stcs(o+c, (floatX)(n * (float)weight[c] + (float)bias[c]));
-//     }
-// }
 
 __global__ void layernorm_forward_kernel_optimized(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
@@ -755,17 +724,17 @@ __global__ void layernorm_forward_kernel_optimized(floatX* __restrict__ out, flo
     int idx = blockIdx.x * num_warps + warp_id;
     if(idx >= N) { return; } // guard
 
-    float m = (float) mean[idx];
-    float s = (float) rstd[idx];
+    float m = __ldcs(mean + idx);
+    float s = __ldcs(rstd + idx);
+
     const floatX* x = inp + idx * C;
     floatX* o = out + idx * C;
 
     for (int c = lane_id * x128::size; c < C; c += WARP_SIZE * x128::size) {
         // Load data into packed format
         x128 inp_packed = load128cs(x + c);
-        x128 weight_packed = load128(weight + c);
-        x128 bias_packed = load128(bias + c);
-
+        x128 weight_packed = load128cs(weight + c);
+        x128 bias_packed = load128cs(bias + c);
         x128 out_packed;
 
         for (int k = 0; k < x128::size; ++k) {
@@ -1656,9 +1625,8 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
     NVTX_RANGE_FN();
     const int block_size = 512;
     const int N = B * T;
-    const int grid_size = CEIL_DIV(N * WARP_SIZE, block_size*x128::size);
+    const int grid_size = CEIL_DIV(N * WARP_SIZE, block_size);
 
-    mean_rstd<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
 
     cudaCheck(cudaGetLastError());
@@ -1670,7 +1638,7 @@ void layernorm_forward_optimized(floatX* out, floatX* mean, floatX* rstd,
     NVTX_RANGE_FN();
     const int block_size = 512;
     const int N = B * T;
-    const int grid_size = CEIL_DIV(N * WARP_SIZE, block_size*x128::size);
+    const int grid_size = CEIL_DIV(N * WARP_SIZE, block_size);
     layernorm_forward_kernel_optimized<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
